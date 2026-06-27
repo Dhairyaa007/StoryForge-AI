@@ -130,7 +130,7 @@ def extract_choices(text):
 # -----------------------------
 # START STORY INPUT
 # -----------------------------
-formatted_scene = st.session_state.current_scene.replace("\n", "<br>")
+
 st.subheader("🧠 Start Your Adventure")
 
 start = st.text_area(
@@ -157,7 +157,7 @@ if start_btn:
 # DISPLAY STORY
 # -----------------------------
 if st.session_state.current_scene:
-
+    formatted_scene = st.session_state.current_scene.replace("\n", "<br>")
     st.divider()
 
     st.markdown(
@@ -227,8 +227,5 @@ Make it feel like a continuous interactive narrative.
 # -----------------------------
 # FOOTER
 # -----------------------------
-st.markdown("---")
-st.markdown(
-    "<p style='text-align:center; color:gray;'>Built with Streamlit + Groq AI</p>",
-    unsafe_allow_html=True
-)
+st.markdown(st.session_state.current_scene)
+
