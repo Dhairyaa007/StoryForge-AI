@@ -1,89 +1,85 @@
-import streamlit as st
-from groq import Groq
 import os
-from dotenv import load_dotenv
+import re
+from html import escape
 
-# -----------------------------
-# LOAD ENV
-# -----------------------------
+import streamlit as st
+from dotenv import load_dotenv
+from groq import Groq
+
+
+MODEL_NAME = "llama-3.3-70b-versatile"
+DEFAULT_CHOICES = ["Continue forward", "Explore the area", "Wait and observe"]
+
+
+THEMES = {
+    "Sci-Fi": "futuristic science fiction",
+    "Fantasy": "high fantasy",
+    "Horror": "atmospheric horror",
+    "Mystery": "detective mystery",
+    "Comedy": "light adventure comedy",
+}
+
+
+DIFFICULTY_GUIDANCE = {
+    "Easy": "Keep danger low and make the next best step fairly clear.",
+    "Medium": "Add complications, but keep choices understandable.",
+    "Hard": "Create meaningful risk, tradeoffs, and consequences.",
+}
+
+
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# -----------------------------
-# PAGE CONFIG
-# -----------------------------
 st.set_page_config(
     page_title="AI StoryForge",
-    page_icon="🎮",
-    layout="wide"
-)
-
-# -----------------------------
-# UI HEADER
-# -----------------------------
-st.markdown(
-    """
-    <h1 style='text-align: center; color: #6C63FF;'>🎮 AI StoryForge</h1>
-    <p style='text-align: center; font-size:18px;'>
-    Interactive AI-powered choose-your-own-adventure game
-    </p>
-    """,
-    unsafe_allow_html=True
-)
-
-st.divider()
-
-# -----------------------------
-# SIDEBAR SETTINGS
-# -----------------------------
-st.sidebar.title("⚙️ Game Settings")
-
-theme = st.sidebar.selectbox(
-    "Story Theme",
-    ["Sci-Fi 🚀", "Fantasy 🏰", "Horror 👻", "Mystery 🕵️", "Comedy 😂"]
-)
-
-difficulty = st.sidebar.selectbox(
-    "Difficulty Level",
-    ["Easy", "Medium", "Hard"]
+    page_icon="GAME",
+    layout="wide",
 )
 
 
-if st.sidebar.button("🔄 Restart Game"):
-    st.session_state.clear()
-    st.rerun()
+@st.cache_resource
+def get_groq_client() -> Groq | None:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return None
+    return Groq(api_key=api_key)
 
-# -----------------------------
-# SESSION STATE INIT
-# -----------------------------
-if "story_history" not in st.session_state:
-    st.session_state.story_history = ""
 
-if "current_scene" not in st.session_state:
-    st.session_state.current_scene = ""
+def initialize_state() -> None:
+    defaults = {
+        "story_history": [],
+        "current_scene": "",
+        "choices": [],
+        "started": False,
+    }
 
-if "choices" not in st.session_state:
-    st.session_state.choices = []
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
-# -----------------------------
-# AI FUNCTION
-# -----------------------------
-def generate_scene(prompt, history=""):
-    system_prompt = f"""
+
+def reset_game() -> None:
+    for key in ("story_history", "current_scene", "choices", "started"):
+        st.session_state.pop(key, None)
+    initialize_state()
+
+
+def build_system_prompt(theme: str, difficulty: str) -> str:
+    return f"""
 You are an interactive story game engine.
 
-Theme: {theme}
+Theme: {THEMES[theme]}
 Difficulty: {difficulty}
+Difficulty guidance: {DIFFICULTY_GUIDANCE[difficulty]}
 
 Rules:
-- Create immersive storytelling
-- Keep scene medium length
-- Always end with EXACTLY 3 choices
-- Choices must be meaningful and different
-- Keep tone consistent with theme
+- Write immersive second-person storytelling.
+- Keep each scene between 180 and 260 words.
+- Maintain continuity with the story so far.
+- Always end with exactly 3 choices.
+- Make choices specific, meaningful, and different from each other.
+- Do not put choice text inside the story section.
 
-OUTPUT FORMAT:
+Output format:
 
 STORY:
 <story text>
@@ -92,140 +88,191 @@ CHOICES:
 1. <choice 1>
 2. <choice 2>
 3. <choice 3>
-"""
+""".strip()
+
+
+def generate_scene(prompt: str, theme: str, difficulty: str) -> str:
+    client = get_groq_client()
+    if client is None:
+        raise RuntimeError("Missing GROQ_API_KEY. Add it to your .env file before starting the app.")
+
+    history = "\n".join(st.session_state.story_history[-8:])
+    user_content = f"""
+Story so far:
+{history or "No story yet."}
+
+Next instruction:
+{prompt}
+""".strip()
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": history + "\n\n" + prompt}
-        ]
+            {"role": "system", "content": build_system_prompt(theme, difficulty)},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.8,
+        max_tokens=900,
     )
 
-    return response.choices[0].message.content
+    return response.choices[0].message.content.strip()
 
-# -----------------------------
-# EXTRACT CHOICES
-# -----------------------------
-def extract_choices(text):
-    try:
-        if "CHOICES:" not in text:
-            return ["Continue", "Explore", "Wait"]
 
-        choices_part = text.split("CHOICES:")[1]
-        lines = choices_part.strip().split("\n")
+def split_scene_and_choices(text: str) -> tuple[str, list[str]]:
+    story_match = re.search(
+        r"STORY:\s*(.*?)(?:\n\s*CHOICES:\s*|\Z)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    choices_match = re.search(
+        r"CHOICES:\s*(.*)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
-        choices = []
-        for line in lines:
-            if line.strip():
-                choice = line.split(".", 1)[-1].strip()
-                if choice:
-                    choices.append(choice)
+    story = story_match.group(1).strip() if story_match else text.strip()
+    raw_choices = choices_match.group(1).strip() if choices_match else ""
 
-        return choices[:3] if len(choices) >= 3 else choices
+    choices = []
+    for line in raw_choices.splitlines():
+        cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+        if cleaned:
+            choices.append(cleaned)
 
-    except:
-        return ["Continue", "Explore", "Wait"]
+    if len(choices) != 3:
+        choices = DEFAULT_CHOICES
 
-# -----------------------------
-# START STORY INPUT
-# -----------------------------
+    return story, choices
 
-st.subheader("🧠 Start Your Adventure")
 
-start = st.text_area(
-    "Enter your story idea",
-    placeholder="e.g. A hacker wakes up inside a broken simulation..."
-)
-
-start_btn = st.button("🚀 Start Adventure")
-
-# -----------------------------
-# START GAME
-# -----------------------------
-if start_btn:
-    if start.strip() == "":
-        st.warning("Please enter a story idea first.")
-    else:
-        with st.spinner("Generating your world..."):
-            scene = generate_scene(start)
-            st.session_state.current_scene = scene
-            st.session_state.story_history = start
-            st.session_state.choices = extract_choices(scene)
-
-# -----------------------------
-# DISPLAY STORY
-# -----------------------------
-if st.session_state.current_scene:
-    formatted_scene = st.session_state.current_scene.replace("\n", "<br>")
-    st.divider()
+def render_scene(text: str) -> None:
+    story, _ = split_scene_and_choices(text)
+    safe_story = escape(story).replace("\n", "<br>")
 
     st.markdown(
         f"""
-        <div style="
-            background-color:#111827;
-            padding:20px;
-            border-radius:12px;
-            color:white;
-            font-size:16px;
-            line-height:1.6;
-        ">
-        {formatted_scene}
+        <div class="story-panel">
+            {safe_story}
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
-    st.divider()
 
-    # -----------------------------
-    # CHOICES UI
-    # -----------------------------
-    st.subheader("🎯 What do you do next?")
+initialize_state()
 
-    choice = st.radio(
-        "Choose your action:",
-        st.session_state.choices
-    )
+st.markdown(
+    """
+    <style>
+        .story-title {
+            text-align: center;
+            color: #4f46e5;
+            margin-bottom: 0.25rem;
+        }
 
-    col1, col2 = st.columns([1, 1])
+        .story-subtitle {
+            text-align: center;
+            font-size: 1.1rem;
+            color: #4b5563;
+            margin-top: 0;
+        }
 
-    with col1:
-        next_btn = st.button("➡️ Continue Story")
+        .story-panel {
+            background: #111827;
+            border: 1px solid #374151;
+            border-radius: 8px;
+            color: white;
+            font-size: 1rem;
+            line-height: 1.65;
+            padding: 1.25rem;
+        }
+    </style>
+    <h1 class="story-title">AI StoryForge</h1>
+    <p class="story-subtitle">Interactive AI-powered choose-your-own-adventure game</p>
+    """,
+    unsafe_allow_html=True,
+)
 
-    with col2:
-        restart_btn = st.button("🔄 Reset Story")
+st.divider()
 
-    # -----------------------------
-    # CONTINUE STORY
-    # -----------------------------
-    if next_btn:
-        with st.spinner("The story evolves..."):
+with st.sidebar:
+    st.title("Game Settings")
+    theme = st.selectbox("Story Theme", list(THEMES.keys()))
+    difficulty = st.selectbox("Difficulty Level", list(DIFFICULTY_GUIDANCE.keys()), index=1)
 
-            new_prompt = f"""
-User chose: {choice}
-
-Continue the story based on this decision.
-Make it feel like a continuous interactive narrative.
-"""
-
-            next_scene = generate_scene(new_prompt, st.session_state.story_history)
-
-            st.session_state.story_history += "\n" + choice
-            st.session_state.current_scene = next_scene
-            st.session_state.choices = extract_choices(next_scene)
-
-            st.rerun()
-
-    # -----------------------------
-    # RESET
-    # -----------------------------
-    if restart_btn:
-        st.session_state.clear()
+    if st.button("Restart Game", use_container_width=True):
+        reset_game()
         st.rerun()
 
-# -----------------------------
-# FOOTER
-# -----------------------------
-st.markdown(st.session_state.current_scene)
+if get_groq_client() is None:
+    st.error("Missing `GROQ_API_KEY`. Add it to your `.env` file, then restart Streamlit.")
+    st.stop()
 
+st.subheader("Start Your Adventure")
+
+start = st.text_area(
+    "Enter your story idea",
+    placeholder="Example: A hacker wakes up inside a broken simulation...",
+    disabled=st.session_state.started,
+)
+
+if st.button("Start Adventure", disabled=st.session_state.started):
+    if not start.strip():
+        st.warning("Please enter a story idea first.")
+    else:
+        with st.spinner("Generating your world..."):
+            try:
+                scene = generate_scene(start.strip(), theme, difficulty)
+            except Exception as exc:
+                st.error(f"Could not generate the scene: {exc}")
+            else:
+                st.session_state.started = True
+                st.session_state.current_scene = scene
+                st.session_state.choices = split_scene_and_choices(scene)[1]
+                st.session_state.story_history = [f"Opening premise: {start.strip()}", scene]
+                st.rerun()
+
+if st.session_state.current_scene:
+    st.divider()
+    render_scene(st.session_state.current_scene)
+    st.divider()
+
+    st.subheader("What do you do next?")
+    choice = st.radio(
+        "Choose your action:",
+        st.session_state.choices,
+        key=f"choice_{len(st.session_state.story_history)}",
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        continue_clicked = st.button("Continue Story", type="primary", use_container_width=True)
+
+    with col2:
+        reset_clicked = st.button("Reset Story", use_container_width=True)
+
+    if continue_clicked:
+        prompt = f"""
+The player chose: {choice}
+
+Continue from that decision. Show the immediate consequence, advance the story,
+and end with exactly 3 new choices.
+""".strip()
+
+        with st.spinner("The story evolves..."):
+            try:
+                next_scene = generate_scene(prompt, theme, difficulty)
+            except Exception as exc:
+                st.error(f"Could not continue the story: {exc}")
+            else:
+                st.session_state.story_history.extend(
+                    [f"Player choice: {choice}", next_scene]
+                )
+                st.session_state.current_scene = next_scene
+                st.session_state.choices = split_scene_and_choices(next_scene)[1]
+                st.rerun()
+
+    if reset_clicked:
+        reset_game()
+        st.rerun()
