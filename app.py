@@ -8,6 +8,7 @@ from groq import Groq
 
 
 MODEL_NAME = "llama-3.3-70b-versatile"
+DEFAULT_MAX_CHAPTERS = 6
 DEFAULT_CHOICES = ["Continue forward", "Explore the area", "Wait and observe"]
 
 
@@ -48,8 +49,12 @@ def get_groq_client() -> Groq | None:
 def initialize_state() -> None:
     defaults = {
         "story_history": [],
+        "chapters": [],
+        "choice_history": [],
         "current_scene": "",
         "choices": [],
+        "chapter": 0,
+        "ended": False,
         "started": False,
     }
 
@@ -58,23 +63,33 @@ def initialize_state() -> None:
 
 
 def reset_game() -> None:
-    for key in ("story_history", "current_scene", "choices", "started"):
+    for key in (
+        "story_history",
+        "chapters",
+        "choice_history",
+        "current_scene",
+        "choices",
+        "chapter",
+        "ended",
+        "started",
+    ):
         st.session_state.pop(key, None)
     initialize_state()
 
 
-def build_system_prompt(theme: str, difficulty: str) -> str:
-    return f"""
-You are an interactive story game engine.
+def build_system_prompt(theme: str, difficulty: str, final_scene: bool = False) -> str:
+    ending_rules = """
+- This is the final scene. Resolve the central conflict clearly.
+- Give the player a satisfying ending based on their choices.
+- Do not include CHOICES or any numbered options.
 
-Theme: {THEMES[theme]}
-Difficulty: {difficulty}
-Difficulty guidance: {DIFFICULTY_GUIDANCE[difficulty]}
+Output format:
 
-Rules:
-- Write immersive second-person storytelling.
-- Keep each scene between 180 and 260 words.
-- Maintain continuity with the story so far.
+STORY:
+<ending text>
+""".strip()
+
+    choice_rules = """
 - Always end with exactly 3 choices.
 - Make choices specific, meaningful, and different from each other.
 - Do not put choice text inside the story section.
@@ -90,8 +105,24 @@ CHOICES:
 3. <choice 3>
 """.strip()
 
+    return f"""
+You are an interactive story game engine.
 
-def generate_scene(prompt: str, theme: str, difficulty: str) -> str:
+Theme: {THEMES[theme]}
+Difficulty: {difficulty}
+Difficulty guidance: {DIFFICULTY_GUIDANCE[difficulty]}
+
+Rules:
+- Write immersive second-person storytelling.
+- Keep each scene between 180 and 260 words.
+- Maintain continuity with the story so far.
+- The adventure must build toward a clear ending.
+
+{ending_rules if final_scene else choice_rules}
+""".strip()
+
+
+def generate_scene(prompt: str, theme: str, difficulty: str, final_scene: bool = False) -> str:
     client = get_groq_client()
     if client is None:
         raise RuntimeError("Missing GROQ_API_KEY. Add it to your .env file before starting the app.")
@@ -108,7 +139,7 @@ Next instruction:
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": build_system_prompt(theme, difficulty)},
+            {"role": "system", "content": build_system_prompt(theme, difficulty, final_scene)},
             {"role": "user", "content": user_content},
         ],
         temperature=0.8,
@@ -159,6 +190,20 @@ def render_scene(text: str) -> None:
     )
 
 
+def render_story_so_far() -> None:
+    if not st.session_state.chapters:
+        return
+
+    with st.expander("Read story from the beginning", expanded=False):
+        for index, chapter_text in enumerate(st.session_state.chapters, start=1):
+            story, _ = split_scene_and_choices(chapter_text)
+            st.markdown(f"#### Chapter {index}")
+            st.markdown(escape(story).replace("\n", "<br>"), unsafe_allow_html=True)
+
+            if index <= len(st.session_state.choice_history):
+                st.info(f"Choice made: {st.session_state.choice_history[index - 1]}")
+
+
 initialize_state()
 
 st.markdown(
@@ -199,6 +244,14 @@ with st.sidebar:
     st.title("Game Settings")
     theme = st.selectbox("Story Theme", list(THEMES.keys()))
     difficulty = st.selectbox("Difficulty Level", list(DIFFICULTY_GUIDANCE.keys()), index=1)
+    max_chapters = st.slider(
+        "Story Length",
+        min_value=3,
+        max_value=10,
+        value=DEFAULT_MAX_CHAPTERS,
+        disabled=st.session_state.started,
+        help="The last chapter resolves the story instead of creating more choices.",
+    )
 
     if st.button("Restart Game", use_container_width=True):
         reset_game()
@@ -229,13 +282,30 @@ if st.button("Start Adventure", disabled=st.session_state.started):
                 st.session_state.started = True
                 st.session_state.current_scene = scene
                 st.session_state.choices = split_scene_and_choices(scene)[1]
+                st.session_state.chapter = 1
+                st.session_state.ended = False
+                st.session_state.chapters = [scene]
+                st.session_state.choice_history = []
                 st.session_state.story_history = [f"Opening premise: {start.strip()}", scene]
                 st.rerun()
 
 if st.session_state.current_scene:
     st.divider()
+    if st.session_state.ended:
+        st.caption("Ending")
+    else:
+        st.caption(f"Chapter {st.session_state.chapter} of {max_chapters}")
+
     render_scene(st.session_state.current_scene)
+    render_story_so_far()
     st.divider()
+
+    if st.session_state.ended:
+        st.success("The story has ended.")
+        if st.button("New Adventure", type="primary"):
+            reset_game()
+            st.rerun()
+        st.stop()
 
     st.subheader("What do you do next?")
     choice = st.radio(
@@ -247,30 +317,45 @@ if st.session_state.current_scene:
     col1, col2 = st.columns(2)
 
     with col1:
-        continue_clicked = st.button("Continue Story", type="primary", use_container_width=True)
+        is_final_choice = st.session_state.chapter >= max_chapters - 1
+        button_label = "Finish Story" if is_final_choice else "Continue Story"
+        continue_clicked = st.button(button_label, type="primary", use_container_width=True)
 
     with col2:
         reset_clicked = st.button("Reset Story", use_container_width=True)
 
     if continue_clicked:
-        prompt = f"""
+        if is_final_choice:
+            prompt = f"""
+The player chose: {choice}
+
+Write the final scene. Resolve the main conflict, show the consequence of this
+choice, and provide a clear ending. Do not include new choices.
+""".strip()
+        else:
+            prompt = f"""
 The player chose: {choice}
 
 Continue from that decision. Show the immediate consequence, advance the story,
 and end with exactly 3 new choices.
 """.strip()
 
-        with st.spinner("The story evolves..."):
+        spinner_text = "Writing the ending..." if is_final_choice else "The story evolves..."
+        with st.spinner(spinner_text):
             try:
-                next_scene = generate_scene(prompt, theme, difficulty)
+                next_scene = generate_scene(prompt, theme, difficulty, final_scene=is_final_choice)
             except Exception as exc:
                 st.error(f"Could not continue the story: {exc}")
             else:
                 st.session_state.story_history.extend(
                     [f"Player choice: {choice}", next_scene]
                 )
+                st.session_state.choice_history.append(choice)
+                st.session_state.chapters.append(next_scene)
                 st.session_state.current_scene = next_scene
-                st.session_state.choices = split_scene_and_choices(next_scene)[1]
+                st.session_state.chapter += 1
+                st.session_state.ended = is_final_choice
+                st.session_state.choices = [] if is_final_choice else split_scene_and_choices(next_scene)[1]
                 st.rerun()
 
     if reset_clicked:
